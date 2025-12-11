@@ -1,0 +1,36 @@
+name: Pairing / X-GURU smoke check
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  checkout-x-guru:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout pairing repo
+        uses: actions/checkout@v4
+
+      - name: Checkout X-GURU repo
+        uses: actions/checkout@v4
+        with:
+          repository: ADDICT-HUB/X-GURU
+          path: X-GURU
+
+      - name: Install pairing repo deps
+        run: |
+          npm ci
+
+      - name: Install X-GURU deps (if any)
+        run: |
+          if [ -f X-GURU/package.json ]; then
+            (cd X-GURU && npm ci --no-audit --no-fund)
+          else
+            echo "No package.json in X-GURU"
+          fi
+
+      - name: Smoke step
+        run: |
+          echo "Pairing repo and X-GURU dependencies installed. Add smoke tests or lint steps as needed."
