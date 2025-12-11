@@ -1,0 +1,119 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>X-GURU Pairing Client</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: Arial, sans-serif; max-width:720px; margin:24px auto; padding:0 12px; }
+    label { display:block; margin-top:12px; font-weight:600; }
+    input[type="text"] { width:100%; padding:8px; font-size:16px; box-sizing:border-box; }
+    button { margin-top:12px; padding:8px 12px; font-size:16px; cursor:pointer; }
+    pre { background:#f4f4f4; padding:12px; overflow:auto; white-space:pre-wrap; word-break:break-word; }
+    img.qr { max-width:320px; display:block; margin-top:12px; border:1px solid #ddd; padding:8px; background:#fff; }
+    .muted { color:#666; font-size:13px; margin-top:6px; }
+    .box { margin-top:14px; padding:12px; border:1px solid #eee; background:#fafafa; border-radius:6px; }
+  </style>
+</head>
+<body>
+  <h2>X-GURU Pairing (Phone + OTP)</h2>
+
+  <div class="box">
+    <label>Phone (E.164)</label>
+    <input id="phone" type="text" placeholder="+15551234567" />
+    <div class="muted">Enter the phone that will scan/receive the pairing code.</div>
+    <button id="pair">Request Pairing (send OTP & get code/QR)</button>
+  </div>
+
+  <div id="result" class="box"></div>
+
+  <div class="box">
+    <label>OTP (from SMS)</label>
+    <input id="otp" type="text" placeholder="123456" />
+    <div class="muted">Enter the 6-digit code you received via SMS.</div>
+    <button id="verify">Verify OTP</button>
+  </div>
+
+  <pre id="output"></pre>
+
+  <script>
+    const pairBtn = document.getElementById('pair');
+    const verifyBtn = document.getElementById('verify');
+    const phoneEl = document.getElementById('phone');
+    const otpEl = document.getElementById('otp');
+    const resultDiv = document.getElementById('result');
+    const out = document.getElementById('output');
+
+    let lastRequestId = null;
+
+    function showJSON(o){ out.textContent = JSON.stringify(o, null, 2); }
+
+    async function api(path, opts){
+      const base = window.location.origin;
+      return fetch(base + path, opts);
+    }
+
+    pairBtn.onclick = async () => {
+      const phone = phoneEl.value.trim();
+      if (!phone) { alert('enter phone'); return; }
+      resultDiv.innerHTML = 'Sending...';
+      try {
+        const r = await api('/pair', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ phone })
+        });
+        const j = await r.json();
+        lastRequestId = j.requestId || null;
+        showJSON(j);
+        resultDiv.innerHTML = '';
+
+        if (j.pairing_code) {
+          const el = document.createElement('div');
+          el.innerHTML = '<strong>Pairing code:</strong> <code>' + j.pairing_code + '</code>';
+          resultDiv.appendChild(el);
+        }
+        if (j.qr) {
+          const img = document.createElement('img');
+          img.className = 'qr';
+          img.src = j.qr;
+          resultDiv.appendChild(img);
+        }
+        if (!j.qr && !j.pairing_code) {
+          const el = document.createElement('div');
+          el.textContent = 'Pending — poll /pair/' + lastRequestId + ' to check status';
+          resultDiv.appendChild(el);
+        }
+      } catch (e) {
+        resultDiv.innerHTML = 'Error: ' + e.message;
+      }
+    };
+
+    verifyBtn.onclick = async () => {
+      const otp = otpEl.value.trim();
+      if (!otp || !lastRequestId) { alert('request pairing first and enter OTP'); return; }
+      try {
+        const r = await api('/pair/' + lastRequestId + '/verify-otp', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ otp })
+        });
+        const j = await r.json();
+        showJSON(j);
+        if (j.sessionId) {
+          const el = document.createElement('div');
+          el.innerHTML = '<strong>SessionId:</strong> <code>' + j.sessionId + '</code>';
+          resultDiv.appendChild(el);
+          if (j.export) {
+            const ex = document.createElement('div');
+            ex.innerHTML = '<strong>Mercedes~ export (paste into X-GURU SESSION_ID):</strong><pre>' + j.export + '</pre>';
+            resultDiv.appendChild(ex);
+          }
+        }
+      } catch (e) {
+        out.textContent = 'Error: ' + e.message;
+      }
+    };
+  </script>
+</body>
+</html>
