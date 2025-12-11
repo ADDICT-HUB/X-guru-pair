@@ -1,0 +1,20 @@
+{
+  "name": "pairing-x-guru",
+  "version": "0.1.0",
+  "description": "Pairing helper for ADDICT-HUB/X-GURU — QR + SMS OTP phone-linking to issue session ids.",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js"
+  },
+  "author": "ADDICT-HUB",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "qrcode": "^1.5.1",
+    "uuid": "^9.0.0",
+    "whatsapp-web.js": "^1.20.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
