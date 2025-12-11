@@ -1,9 +1,9 @@
+// server/index.js
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const qrcode = require('qrcode');
 const { v4: uuidv4 } = require('uuid');
-const crypto = require('crypto');
 
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
@@ -19,8 +19,14 @@ if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
   }
 }
 
-// Default WA lib. If X-GURU uses another lib, adapt accordingly.
-const { Client, LocalAuth } = require('whatsapp-web.js');
+// Baileys imports
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  Browsers,
+  DisconnectReason
+} = require('@adiwajshing/baileys');
 
 const app = express();
 app.use(express.json());
@@ -28,7 +34,7 @@ app.use(express.json());
 const SESSIONS_DIR = path.join(__dirname, '..', 'sessions');
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 
-const clients = {}; // requestId -> { client, status, ... }
+const clients = {}; // requestId -> { socket, state, saveCreds, status, ... }
 const otps = {}; // requestId -> { code, phone, expiresAt, verified }
 
 function generateOtp() {
@@ -49,131 +55,175 @@ async function sendSms(phone, message) {
       return false;
     }
   } else {
-    // fallback for development: log OTP to console
     console.log(`SIMULATED SMS to ${phone}: ${message}`);
     return true;
   }
 }
 
-// POST /pair { phone: "+1555..." }
+// Helper: produce Mercedes~<base64> export of the auth creds (all files under sessionPath)
+function exportCredsAsMercedesBase64(sessionPath) {
+  try {
+    const files = fs.readdirSync(sessionPath);
+    const state = {};
+    for (const file of files) {
+      const full = path.join(sessionPath, file);
+      if (fs.lstatSync(full).isFile()) {
+        state[file] = fs.readFileSync(full, 'utf8');
+      }
+    }
+    const payload = JSON.stringify(state);
+    const b64 = Buffer.from(payload, 'utf8').toString('base64');
+    return `Mercedes~${b64}`;
+  } catch (e) {
+    console.error('exportCreds error', e);
+    return null;
+  }
+}
+
+/**
+ * POST /pair { phone: "+1555..." }
+ * - create requestId
+ * - generate OTP and send via SMS (or log)
+ * - create Baileys state under ./sessions/<requestId> using useMultiFileAuthState
+ * - start a socket and call requestPairingCode(phone) if available
+ * - listen for connection.update to get qr and ready state
+ */
 app.post('/pair', async (req, res) => {
   const phone = (req.body && req.body.phone) ? String(req.body.phone) : null;
   if (!phone) return res.status(400).json({ error: 'phone is required (E.164 format)' });
 
   const requestId = uuidv4();
   const otp = generateOtp();
-  const expiresAt = Date.now() + (5 * 60 * 1000); // 5 minutes
-
+  const expiresAt = Date.now() + 5 * 60 * 1000; // 5 mins
   otps[requestId] = { code: otp, phone, expiresAt, verified: false, created_at: new Date().toISOString() };
 
-  // Send OTP asynchronously (do not block client too long)
   sendSms(phone, `Your X-GURU pairing code is: ${otp}`).then(ok => {
     if (!ok) console.warn('OTP delivery may have failed for', phone);
   });
 
-  // prepare WA client; store the session at ./sessions/<requestId>
   const sessionPath = path.join(SESSIONS_DIR, requestId);
-  const client = new Client({
-    authStrategy: new LocalAuth({ clientId: requestId, dataPath: sessionPath }),
-    puppeteer: { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] }
+  if (!fs.existsSync(sessionPath)) fs.mkdirSync(sessionPath, { recursive: true });
+
+  // create an auth state that writes files under sessions/<requestId>
+  const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+
+  // fetch baileys version
+  const { version } = await fetchLatestBaileysVersion();
+
+  // create socket
+  const socket = makeWASocket({
+    logger: { level: 'silent' },
+    browser: Browsers.macOS('Firefox'),
+    auth: state,
+    version,
+    printQRInTerminal: false, // we will return QR via endpoint
   });
 
-  clients[requestId] = { client, status: 'initializing', phone, created_at: new Date().toISOString() };
+  clients[requestId] = { socket, state, saveCreds, status: 'initializing', phone, created_at: new Date().toISOString() };
+
+  // persist creds when updated
+  socket.ev.on('creds.update', saveCreds);
 
   let responded = false;
 
-  client.on('qr', async (qr) => {
+  socket.ev.on('connection.update', async (update) => {
     try {
-      const dataUrl = await qrcode.toDataURL(qr);
-      clients[requestId].status = 'qr';
-      clients[requestId].qr = dataUrl;
-      // return QR immediately if still waiting
+      const { connection, lastDisconnect, qr } = update;
+
+      if (qr) {
+        try {
+          const dataUrl = await qrcode.toDataURL(qr);
+          clients[requestId].status = 'qr';
+          clients[requestId].qr = dataUrl;
+          if (!responded) {
+            responded = true;
+            return res.json({ requestId, status: 'qr', qr: dataUrl, message: 'OTP sent to phone.' });
+          }
+        } catch (e) {
+          console.error('QR->DataURL error', e);
+        }
+      }
+
+      if (connection === 'open') {
+        const sessionId = uuidv4();
+        clients[requestId].status = 'ready';
+        clients[requestId].sessionId = sessionId;
+        clients[requestId].ready_at = new Date().toISOString();
+
+        const meta = { sessionId, requestId, phone, created_at: clients[requestId].created_at, ready_at: clients[requestId].ready_at };
+        try {
+          fs.writeFileSync(path.join(sessionPath, 'meta.json'), JSON.stringify(meta, null, 2));
+        } catch (e) {
+          console.error('Failed to write meta.json', e);
+        }
+
+        const otpRec = otps[requestId];
+        if (otpRec && otpRec.verified) {
+          if (twilioClient) {
+            try {
+              await twilioClient.messages.create({
+                body: `Pairing complete. sessionId: ${sessionId}`,
+                from: TWILIO_FROM,
+                to: phone
+              });
+            } catch (e) {
+              console.warn('Failed to SMS sessionId:', e.message || e);
+            }
+          } else {
+            console.log(`Pairing complete for ${phone}. sessionId: ${sessionId}`);
+          }
+          clients[requestId].linked = true;
+          clients[requestId].linked_at = new Date().toISOString();
+        }
+
+        const exportBase64 = exportCredsAsMercedesBase64(sessionPath);
+        clients[requestId].export = exportBase64;
+
+        console.log('Baileys client ready for', requestId);
+      }
+
+      if (connection === 'close') {
+        const code = lastDisconnect?.error?.output?.statusCode || null;
+        if (code === DisconnectReason.loggedOut) {
+          console.log('Logged out for', requestId);
+          clients[requestId].status = 'logged_out';
+        } else {
+          console.log('Connection closed for', requestId, 'reason', code);
+          clients[requestId].status = 'disconnected';
+        }
+      }
+    } catch (e) {
+      console.error('connection.update handler error', e);
+    }
+  });
+
+  // try requestPairingCode if available
+  try {
+    if (typeof socket.requestPairingCode === 'function') {
+      const normalized = phone.replace(/[^0-9]/g, '');
+      const raw = await socket.requestPairingCode(normalized);
+      const code = String(raw).match(/.{1,4}/g)?.join('-') || String(raw);
+      clients[requestId].pairing_code = code;
       if (!responded) {
         responded = true;
-        return res.json({ requestId, status: 'qr', qr: dataUrl, message: 'OTP sent to phone.' });
+        return res.json({ requestId, status: 'pairing_code', pairing_code: code, message: 'OTP sent to phone.' });
       }
-    } catch (err) {
-      console.error('QR->DataURL error', err);
     }
-  });
-
-  client.on('ready', async () => {
-    const sessionId = uuidv4();
-    clients[requestId].status = 'ready';
-    clients[requestId].sessionId = sessionId;
-    clients[requestId].ready_at = new Date().toISOString();
-
-    const meta = { sessionId, requestId, phone, created_at: clients[requestId].created_at, ready_at: clients[requestId].ready_at };
-    try {
-      if (!fs.existsSync(sessionPath)) fs.mkdirSync(sessionPath, { recursive: true });
-      fs.writeFileSync(path.join(sessionPath, 'meta.json'), JSON.stringify(meta, null, 2));
-    } catch (e) {
-      console.error('Failed to write meta.json', e);
-    }
-
-    // if OTP already verified, finalize and (optionally) notify the phone via SMS
-    const otpRec = otps[requestId];
-    if (otpRec && otpRec.verified) {
-      // notify user with sessionId via SMS (best effort)
-      if (twilioClient) {
-        try {
-          await twilioClient.messages.create({
-            body: `Pairing complete. sessionId: ${sessionId}`,
-            from: TWILIO_FROM,
-            to: phone
-          });
-        } catch (e) {
-          console.warn('Failed to SMS sessionId:', e.message || e);
-        }
-      } else {
-        console.log(`Pairing complete for ${phone}. sessionId: ${sessionId}`);
-      }
-      clients[requestId].linked = true;
-      clients[requestId].linked_at = new Date().toISOString();
-    }
-
-    console.log('Client ready for requestId', requestId);
-  });
-
-  client.on('auth_failure', (msg) => {
-    console.error('auth_failure', msg);
-    clients[requestId].status = 'failed';
-    clients[requestId].error = String(msg);
-    if (!responded) {
-      responded = true;
-      res.status(500).json({ requestId, status: 'failed', error: String(msg) });
-    }
-    client.destroy().catch(() => {});
-  });
-
-  client.on('disconnected', (reason) => {
-    console.log('Client disconnected', requestId, reason);
-    clients[requestId].status = 'disconnected';
-    clients[requestId].last_disconnect_reason = reason;
-  });
-
-  // initialize client
-  try {
-    client.initialize();
   } catch (e) {
-    console.error('client.initialize error', e);
-    clients[requestId].status = 'failed';
-    if (!responded) {
-      responded = true;
-      return res.status(500).json({ requestId, status: 'failed', error: String(e) });
-    }
+    console.warn('requestPairingCode not available or failed:', e && e.message);
   }
 
-  // safety: if no QR in 15s, return pending with requestId (client will continue running)
   setTimeout(() => {
     if (!responded) {
       responded = true;
-      res.json({ requestId, status: 'pending', message: 'OTP sent. Waiting for QR (poll /pair/:requestId).' });
+      res.json({ requestId, status: 'pending', message: 'OTP sent. Waiting for QR/pairing code (poll /pair/:requestId).' });
     }
   }, 15000);
 });
 
-// POST /pair/:requestId/verify-otp { otp: "123456" }
+/**
+ * POST /pair/:requestId/verify-otp { otp: "123456" }
+ */
 app.post('/pair/:requestId/verify-otp', (req, res) => {
   const requestId = req.params.requestId;
   const bodyOtp = (req.body && req.body.otp) ? String(req.body.otp).trim() : null;
@@ -188,13 +238,11 @@ app.post('/pair/:requestId/verify-otp', (req, res) => {
   if (bodyOtp === rec.code) {
     rec.verified = true;
     rec.verified_at = new Date().toISOString();
-    // if client already ready, return sessionId immediately
     const c = clients[requestId];
     if (c && c.sessionId) {
-      // mark linked and return sessionId
       c.linked = true;
       c.linked_at = new Date().toISOString();
-      return res.json({ requestId, verified: true, sessionId: c.sessionId });
+      return res.json({ requestId, verified: true, sessionId: c.sessionId, export: c.export || null });
     }
     return res.json({ requestId, verified: true, message: 'OTP verified. Waiting for WhatsApp connection to complete.' });
   } else {
@@ -202,12 +250,13 @@ app.post('/pair/:requestId/verify-otp', (req, res) => {
   }
 });
 
-// GET /pair/:requestId
+/**
+ * GET /pair/:requestId
+ */
 app.get('/pair/:requestId', (req, res) => {
   const requestId = req.params.requestId;
   const c = clients[requestId] || null;
   const otpRec = otps[requestId] || null;
-
   if (!c && !otpRec) return res.status(404).json({ error: 'not found' });
 
   res.json({
@@ -215,15 +264,19 @@ app.get('/pair/:requestId', (req, res) => {
     status: c ? c.status : 'unknown',
     phone: c ? c.phone : (otpRec ? otpRec.phone : null),
     qr: c && c.qr ? c.qr : null,
+    pairing_code: c && c.pairing_code ? c.pairing_code : null,
     otp_verified: otpRec ? !!otpRec.verified : false,
     sessionId: c && c.sessionId ? c.sessionId : null,
+    export: c && c.export ? c.export : null,
     linked: c && c.linked ? true : false,
     error: c && c.error ? c.error : null,
     created_at: c ? c.created_at : (otpRec ? otpRec.created_at : null)
   });
 });
 
-// GET /sessions
+/**
+ * GET /sessions
+ */
 app.get('/sessions', (req, res) => {
   try {
     const items = fs.readdirSync(SESSIONS_DIR).map(name => {
@@ -238,7 +291,7 @@ app.get('/sessions', (req, res) => {
   }
 });
 
-// cleanup expired OTPs occasionally
+// cleanup expired OTPs
 setInterval(() => {
   const now = Date.now();
   for (const id of Object.keys(otps)) {
@@ -250,4 +303,4 @@ setInterval(() => {
 }, 60 * 1000);
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`Pairing server listening on ${PORT}`));
+app.listen(PORT, () => console.log(`Pairing server (Baileys) listening on ${PORT}`));
