@@ -31,6 +31,14 @@ const {
 const app = express();
 app.use(express.json());
 
+// Serve the static client UI (public/client.html)
+const PUBLIC_DIR = path.join(__dirname, '..', 'public');
+if (!fs.existsSync(PUBLIC_DIR)) fs.mkdirSync(PUBLIC_DIR, { recursive: true });
+app.use(express.static(PUBLIC_DIR));
+app.get('/', (req, res) => {
+  res.sendFile(path.join(PUBLIC_DIR, 'client.html'));
+});
+
 const SESSIONS_DIR = path.join(__dirname, '..', 'sessions');
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 
@@ -55,6 +63,7 @@ async function sendSms(phone, message) {
       return false;
     }
   } else {
+    // dev fallback
     console.log(`SIMULATED SMS to ${phone}: ${message}`);
     return true;
   }
@@ -97,6 +106,7 @@ app.post('/pair', async (req, res) => {
   const expiresAt = Date.now() + 5 * 60 * 1000; // 5 mins
   otps[requestId] = { code: otp, phone, expiresAt, verified: false, created_at: new Date().toISOString() };
 
+  // send OTP (async)
   sendSms(phone, `Your X-GURU pairing code is: ${otp}`).then(ok => {
     if (!ok) console.warn('OTP delivery may have failed for', phone);
   });
@@ -116,7 +126,7 @@ app.post('/pair', async (req, res) => {
     browser: Browsers.macOS('Firefox'),
     auth: state,
     version,
-    printQRInTerminal: false, // we will return QR via endpoint
+    printQRInTerminal: false,
   });
 
   clients[requestId] = { socket, state, saveCreds, status: 'initializing', phone, created_at: new Date().toISOString() };
@@ -213,6 +223,7 @@ app.post('/pair', async (req, res) => {
     console.warn('requestPairingCode not available or failed:', e && e.message);
   }
 
+  // fallback response
   setTimeout(() => {
     if (!responded) {
       responded = true;
@@ -223,6 +234,7 @@ app.post('/pair', async (req, res) => {
 
 /**
  * POST /pair/:requestId/verify-otp { otp: "123456" }
+ * Verifies OTP. If socket is already ready, returns sessionId immediately.
  */
 app.post('/pair/:requestId/verify-otp', (req, res) => {
   const requestId = req.params.requestId;
@@ -252,6 +264,7 @@ app.post('/pair/:requestId/verify-otp', (req, res) => {
 
 /**
  * GET /pair/:requestId
+ * Returns status, qr (if any), pairing_code (if any), otp_verified, sessionId and Mercedes export
  */
 app.get('/pair/:requestId', (req, res) => {
   const requestId = req.params.requestId;
@@ -276,6 +289,7 @@ app.get('/pair/:requestId', (req, res) => {
 
 /**
  * GET /sessions
+ * Lists saved session meta files found under ./sessions
  */
 app.get('/sessions', (req, res) => {
   try {
@@ -291,7 +305,7 @@ app.get('/sessions', (req, res) => {
   }
 });
 
-// cleanup expired OTPs
+// cleanup expired OTPs occasionally
 setInterval(() => {
   const now = Date.now();
   for (const id of Object.keys(otps)) {
